@@ -143,8 +143,16 @@ Listings Items APIで商品登録する際、productTypeが必須となる。ASI
 | ファイル | 関数 | 役割 |
 |---------|------|------|
 | spapi_registerProducts.js | spapi_getProductTypeByAsin | ASINから商品タイプを取得（includedData=summaries,productTypes） |
-| spapi_Shipment.js | spapi_getAsinIdentifiers_ | ASINのidentifier一覧を取得（includedData=identifiers） |
-| spapi_Shipment.js | spapi_isAsinAmazonLabelEligible_ | JAN/EAN/UPC/ISBN/GCID/GTINの有無でAmazon貼付可否を判定 |
+| spapi_Shipment.js | spapi_fetchAsinIdentifiersBatch_ | 複数ASINのidentifierを `UrlFetchApp.fetchAll` でバッチ並列取得（2件/バッチ、600ms間隔、429時は指数バックオフリトライ） |
+| spapi_Shipment.js | spapi_parseIdentifierTypes_ | Catalog APIレスポンスからidentifierTypeを抽出 |
+| spapi_Shipment.js | spapi_getCachedIdentifiersBulk_ / spapi_putCachedIdentifiers_ | ASIN単位でidentifierを `CacheService.getScriptCache()` にキャッシュ（TTL 600秒、キー `spapi:catalog:ident:v1:<ASIN>`） |
+| spapi_Shipment.js | spapi_getAsinIdentifiers_ | ASINのidentifier一覧を取得（単一ASIN用、デバッグ用途で残置） |
+| spapi_Shipment.js | spapi_isAsinAmazonLabelEligible_ | JAN/EAN/UPC/ISBN/GCID/GTINの有無でAmazon貼付可否を判定（単一ASIN用、デバッグ用途で残置） |
+
+**並列化とキャッシュの背景**:
+- Catalog Items API は 2 rps 制限のため、単純な逐次呼び出しでは SKU数×800ms の時間がかかっていた
+- `UrlFetchApp.fetchAll` で最大2件の並列リクエストにバッチ化し、各バッチ間に 600ms 待機することで 2 rps を遵守しつつスループットを改善
+- ASIN→identifier の結果はセッション内で高頻度に再利用されるため、ScriptCache に10分間保持することで再実行時のAPI呼び出しを削減
 
 ### 処理フロー
 

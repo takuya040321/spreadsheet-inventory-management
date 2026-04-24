@@ -23,6 +23,10 @@
 var SPAPI_SHIPMENT_CACHE_KEY = "SPAPI_SHIPMENT_SKU_COUNTS";
 var SPAPI_LABEL_SPLIT_CACHE_KEY = "SPAPI_SHIPMENT_LABEL_SPLIT";
 var SPAPI_LABEL_SCANNABLE_TYPES = ["EAN", "JAN", "UPC", "ISBN", "GCID", "GTIN"];
+var SPAPI_IDENTIFIER_CACHE_KEY_PREFIX = "spapi:catalog:ident:v1:";
+var SPAPI_IDENTIFIER_CACHE_TTL_SECONDS = 600;
+var SPAPI_CATALOG_BATCH_SIZE = 2;
+var SPAPI_CATALOG_BATCH_INTERVAL_MS = 600;
 
 // ===========================================
 // メイン処理
@@ -337,6 +341,208 @@ function spapi_isAsinAmazonLabelEligible_(accessToken, asin, marketplaceId, endp
 }
 
 /**
+ * Catalog APIレスポンスボディからidentifierTypeの配列を抽出する
+ * @param {string} responseBody - レスポンス本文
+ * @param {string} marketplaceId - マーケットプレイスID
+ * @returns {Array<string>} identifierTypeの配列
+ */
+function spapi_parseIdentifierTypes_(responseBody, marketplaceId) {
+  const identifierTypes = [];
+  let json;
+  try {
+    json = JSON.parse(responseBody);
+  } catch (e) {
+    return identifierTypes;
+  }
+  if (!json.identifiers || !Array.isArray(json.identifiers)) {
+    return identifierTypes;
+  }
+  for (const marketplaceEntry of json.identifiers) {
+    if (marketplaceEntry.marketplaceId !== marketplaceId) {
+      continue;
+    }
+    const innerList = marketplaceEntry.identifiers || [];
+    for (const identifier of innerList) {
+      if (identifier.identifierType) {
+        identifierTypes.push(String(identifier.identifierType).toUpperCase());
+      }
+    }
+  }
+  return identifierTypes;
+}
+
+/**
+ * identifierキャッシュキーを生成する
+ * @param {string} asin - ASIN
+ * @returns {string} キャッシュキー
+ */
+function spapi_buildIdentifierCacheKey_(asin) {
+  return SPAPI_IDENTIFIER_CACHE_KEY_PREFIX + asin;
+}
+
+/**
+ * ASINに対応するidentifierキャッシュを取得する
+ * @param {string} asin - ASIN
+ * @returns {Array<string>|null} キャッシュ済みのidentifier配列、未ヒットはnull
+ */
+function spapi_getCachedIdentifiers_(asin) {
+  const raw = CacheService.getScriptCache().get(spapi_buildIdentifierCacheKey_(asin));
+  if (!raw) {
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * ASINに対応するidentifierをキャッシュに保存する
+ * @param {string} asin - ASIN
+ * @param {Array<string>} identifiers - identifierTypeの配列
+ */
+function spapi_putCachedIdentifiers_(asin, identifiers) {
+  try {
+    CacheService.getScriptCache().put(
+      spapi_buildIdentifierCacheKey_(asin),
+      JSON.stringify(identifiers),
+      SPAPI_IDENTIFIER_CACHE_TTL_SECONDS
+    );
+  } catch (e) {
+    console.warn("identifierキャッシュ保存失敗 (ASIN: " + asin + "): " + e.message);
+  }
+}
+
+/**
+ * 複数ASINのidentifierキャッシュをまとめて取得する
+ * @param {Array<string>} asins - ASIN配列
+ * @returns {Object} { hit: { asin: identifiers[] }, miss: string[] }
+ */
+function spapi_getCachedIdentifiersBulk_(asins) {
+  const hit = {};
+  const miss = [];
+  if (!asins || asins.length === 0) {
+    return { hit: hit, miss: miss };
+  }
+  const keys = asins.map(asin => spapi_buildIdentifierCacheKey_(asin));
+  const cached = CacheService.getScriptCache().getAll(keys) || {};
+  for (const asin of asins) {
+    const raw = cached[spapi_buildIdentifierCacheKey_(asin)];
+    if (!raw) {
+      miss.push(asin);
+      continue;
+    }
+    try {
+      hit[asin] = JSON.parse(raw);
+    } catch (e) {
+      miss.push(asin);
+    }
+  }
+  return { hit: hit, miss: miss };
+}
+
+/**
+ * Catalog APIをバッチ並列で呼び出し、ASINごとのidentifierTypeを取得する
+ * @param {string} accessToken - SP-APIアクセストークン
+ * @param {Array<string>} asins - 取得対象のASIN配列（重複除去済み）
+ * @param {string} marketplaceId - マーケットプレイスID
+ * @param {string} endpoint - SP-APIエンドポイント
+ * @returns {Object} { asin: identifierTypes[] }
+ */
+function spapi_fetchAsinIdentifiersBatch_(accessToken, asins, marketplaceId, endpoint) {
+  const results = {};
+  if (!asins || asins.length === 0) {
+    return results;
+  }
+
+  const buildRequest = function(asin) {
+    return {
+      url: endpoint +
+           "/catalog/2022-04-01/items/" +
+           encodeURIComponent(asin) +
+           "?marketplaceIds=" + marketplaceId +
+           "&includedData=identifiers",
+      method: "get",
+      headers: {
+        "x-amz-access-token": accessToken,
+        "Accept": "application/json"
+      },
+      muteHttpExceptions: true
+    };
+  };
+
+  for (let i = 0; i < asins.length; i += SPAPI_CATALOG_BATCH_SIZE) {
+    const batch = asins.slice(i, i + SPAPI_CATALOG_BATCH_SIZE);
+    const requests = batch.map(buildRequest);
+
+    let responses;
+    try {
+      responses = UrlFetchApp.fetchAll(requests);
+    } catch (e) {
+      console.warn("Catalog APIバッチ呼び出し失敗: " + e.message);
+      for (const asin of batch) {
+        results[asin] = [];
+      }
+      if (i + SPAPI_CATALOG_BATCH_SIZE < asins.length) {
+        Utilities.sleep(SPAPI_CATALOG_BATCH_INTERVAL_MS);
+      }
+      continue;
+    }
+
+    let retryIndexes = [];
+    for (let idx = 0; idx < responses.length; idx++) {
+      if (responses[idx].getResponseCode() === 429) {
+        retryIndexes.push(idx);
+      }
+    }
+
+    let backoff = 1000;
+    for (let attempt = 0; attempt < 2 && retryIndexes.length > 0; attempt++) {
+      Utilities.sleep(backoff);
+      const retryRequests = retryIndexes.map(idx => requests[idx]);
+      let retryResponses;
+      try {
+        retryResponses = UrlFetchApp.fetchAll(retryRequests);
+      } catch (e) {
+        console.warn("Catalog APIリトライ失敗: " + e.message);
+        break;
+      }
+      const nextRetry = [];
+      for (let j = 0; j < retryResponses.length; j++) {
+        const originalIdx = retryIndexes[j];
+        const response = retryResponses[j];
+        if (response.getResponseCode() === 429) {
+          nextRetry.push(originalIdx);
+        } else {
+          responses[originalIdx] = response;
+        }
+      }
+      retryIndexes = nextRetry;
+      backoff *= 2;
+    }
+
+    for (let idx = 0; idx < responses.length; idx++) {
+      const asin = batch[idx];
+      const response = responses[idx];
+      const code = response.getResponseCode();
+      if (code === 200) {
+        results[asin] = spapi_parseIdentifierTypes_(response.getContentText(), marketplaceId);
+        continue;
+      }
+      console.warn("Catalog API error (ASIN: " + asin + ", HTTP " + code + "): " + response.getContentText());
+      results[asin] = [];
+    }
+
+    if (i + SPAPI_CATALOG_BATCH_SIZE < asins.length) {
+      Utilities.sleep(SPAPI_CATALOG_BATCH_INTERVAL_MS);
+    }
+  }
+
+  return results;
+}
+
+/**
  * 全SKUをAmazon貼付可否で分類する
  * @param {Object} skuCounts - SKUと個数のマップ
  * @param {string} accessToken - SP-APIアクセストークン
@@ -348,28 +554,37 @@ function spapi_classifySkusByLabelEligibility_(skuCounts, accessToken, marketpla
   const labelOwnerMap = {};
   const sellerOnlySkus = [];
   const unknownSkus = [];
+  const skuToAsin = {};
 
-  const skus = Object.keys(skuCounts);
-  for (let i = 0; i < skus.length; i++) {
-    const sku = skus[i];
+  for (const sku of Object.keys(skuCounts)) {
     const asin = spapi_extractAsinFromSku_(sku);
-
     if (!asin) {
       labelOwnerMap[sku] = "SELLER";
       unknownSkus.push(sku);
-      console.log("ASIN抽出不可、SELLERとして扱う: " + sku);
       continue;
     }
+    skuToAsin[sku] = asin;
+  }
 
-    const eligible = spapi_isAsinAmazonLabelEligible_(accessToken, asin, marketplaceId, endpoint);
+  const uniqueAsins = Array.from(new Set(Object.values(skuToAsin)));
+  const cacheResult = spapi_getCachedIdentifiersBulk_(uniqueAsins);
+  const asinToIdentifiers = Object.assign({}, cacheResult.hit);
+
+  if (cacheResult.miss.length > 0) {
+    const fetched = spapi_fetchAsinIdentifiersBatch_(accessToken, cacheResult.miss, marketplaceId, endpoint);
+    for (const asin of Object.keys(fetched)) {
+      asinToIdentifiers[asin] = fetched[asin];
+      spapi_putCachedIdentifiers_(asin, fetched[asin]);
+    }
+  }
+
+  for (const sku of Object.keys(skuToAsin)) {
+    const asin = skuToAsin[sku];
+    const identifiers = asinToIdentifiers[asin] || [];
+    const eligible = identifiers.some(type => SPAPI_LABEL_SCANNABLE_TYPES.indexOf(type) !== -1);
     labelOwnerMap[sku] = eligible ? "AMAZON" : "SELLER";
     if (!eligible) {
       sellerOnlySkus.push(sku);
-    }
-    console.log("分類: " + sku + " (ASIN: " + asin + ") → " + labelOwnerMap[sku]);
-
-    if (i < skus.length - 1) {
-      Utilities.sleep(600);
     }
   }
 

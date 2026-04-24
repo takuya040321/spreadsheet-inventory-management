@@ -108,15 +108,22 @@ flowchart TB
    - AMAZON非対応: labelOwner=SELLER（自動切替）
    - ASIN抽出不可: labelOwner=SELLER（フェイルセーフ）
 
-**レート制限対応**: Catalog Items APIは2 rpsのため、各呼び出し間に600ms待機する。
+**レート制限対応**: Catalog Items APIは2 rpsのため、2件ずつのバッチに分割し `UrlFetchApp.fetchAll` で並列取得する。各バッチ間に600ms待機することで 2 rps を遵守する。バッチ内で429が返った場合は指数バックオフ（1000ms→2000ms）で最大2回リトライする。
+
+**キャッシュ戦略**: ASIN単位で identifier 取得結果を `CacheService.getScriptCache()` に保存する（TTL 600秒）。キーは `spapi:catalog:ident:v1:<ASIN>` 形式。同一セッション内の再実行時はキャッシュヒット分の API 呼び出しをスキップする。identifier が空配列のASINも negative cache として同TTLで保持する。
 
 **関連関数**:
 
 | 関数 | 用途 |
 |------|------|
 | spapi_extractAsinFromSku_ | SKU文字列からASINを正規表現で抽出 |
-| spapi_getAsinIdentifiers_ | Catalog APIでidentifierType一覧を取得 |
-| spapi_isAsinAmazonLabelEligible_ | スキャン可能なバーコード有無を判定 |
+| spapi_parseIdentifierTypes_ | Catalog APIレスポンスからidentifierTypeを抽出 |
+| spapi_getCachedIdentifiers_ | 単一ASINのキャッシュ取得 |
+| spapi_putCachedIdentifiers_ | ASIN単位でキャッシュへ保存 |
+| spapi_getCachedIdentifiersBulk_ | 複数ASINのキャッシュを一括取得（hit/miss分離） |
+| spapi_fetchAsinIdentifiersBatch_ | Catalog APIをバッチ並列呼び出しで取得（UrlFetchApp.fetchAll使用） |
+| spapi_getAsinIdentifiers_ | Catalog APIでidentifierType一覧を取得（単一ASIN、デバッグ用途で残置） |
+| spapi_isAsinAmazonLabelEligible_ | スキャン可能なバーコード有無を判定（単一ASIN、デバッグ用途で残置） |
 
 ### 分割確認ダイアログ
 
