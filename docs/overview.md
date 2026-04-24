@@ -76,7 +76,8 @@ flowchart TB
 | mercariDataProcessing.js | 465 | メルカリ データ処理・SKU検索 |
 | mercariProductTransfer.js | 144 | メルカリ 商品管理転記 |
 | registerProducts.js | 998 | SP-API商品登録 |
-| Fbashipment.js | 637 | FBA納品プラン作成 |
+| spapi_Shipment.js | - | FBA納品プラン作成（サーバ処理） |
+| spapi_ShipmentDialog.html | - | FBA納品プラン作成確認ダイアログ |
 | FbaLabelGenerator.js | 336 | FBAラベル生成 |
 | CopyToProductManagement.js | 310 | 利益確認シート→商品管理コピー |
 | spapi_bulk_listing_register.js | 240 | SP-API一括登録補助 |

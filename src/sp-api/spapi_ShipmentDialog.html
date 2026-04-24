@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <base target="_top">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 12px; color: #202124; }
+        h2 { margin-top: 0; font-size: 16px; }
+        h3 { font-size: 13px; margin: 10px 0 4px; color: #5f6368; }
+        .sku-list {
+            max-height: 140px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 8px;
+            font-family: monospace;
+            font-size: 12px;
+            background: #fafafa;
+            border-radius: 4px;
+        }
+        .sku-row { display: flex; justify-content: space-between; padding: 2px 0; }
+        .summary { margin: 8px 0; font-size: 13px; }
+        .options {
+            margin: 12px 0;
+            padding: 10px 12px;
+            background: #f0f7ff;
+            border-radius: 4px;
+        }
+        .options strong { display: block; margin-bottom: 6px; font-size: 13px; }
+        .options label { display: block; padding: 4px 0; cursor: pointer; font-size: 13px; }
+        .options label input { margin-right: 6px; }
+        .buttons { margin-top: 14px; text-align: right; }
+        button { padding: 6px 16px; margin-left: 6px; cursor: pointer; font-size: 13px; }
+        button.primary { background: #1a73e8; color: white; border: 1px solid #1a73e8; border-radius: 4px; }
+        button.secondary { background: white; border: 1px solid #ccc; border-radius: 4px; }
+        button:disabled { opacity: 0.5; cursor: wait; }
+        .status { margin-top: 10px; font-size: 13px; color: #5f6368; min-height: 18px; }
+        .hidden { display: none; }
+        .warn-box {
+            background: #fff3e0;
+            border-left: 3px solid #ff9800;
+            padding: 10px;
+            margin: 10px 0;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        .info-box {
+            background: #e3f2fd;
+            border-left: 3px solid #1a73e8;
+            padding: 10px;
+            margin: 10px 0;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        .raw-error {
+            background: #f5f5f5;
+            padding: 8px;
+            font-family: monospace;
+            font-size: 11px;
+            max-height: 120px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            border-radius: 4px;
+        }
+        details { margin-top: 10px; }
+        summary { cursor: pointer; font-size: 12px; color: #5f6368; }
+        .section { margin-bottom: 10px; }
+        .badge {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 10px;
+            font-size: 11px;
+            margin-left: 4px;
+        }
+        .badge.amazon { background: #e8f5e9; color: #2e7d32; }
+        .badge.seller { background: #fff3e0; color: #ef6c00; }
+    </style>
+</head>
+<body>
+    <div id="confirm-view">
+        <h2>FBA納品プラン作成確認</h2>
+        <div class="sku-list" id="sku-list">読み込み中...</div>
+        <div class="summary" id="summary"></div>
+        <div class="options">
+            <strong>商品ラベルの貼付</strong>
+            <label><input type="radio" name="labelOwner" value="AMAZON" checked>Amazonに貼付を依頼（有料）</label>
+            <label><input type="radio" name="labelOwner" value="SELLER">自分で貼付する</label>
+        </div>
+        <div class="buttons">
+            <button type="button" class="secondary" onclick="closeDialog()">キャンセル</button>
+            <button type="button" class="primary" id="submitBtn" onclick="onSubmit()">はい</button>
+        </div>
+        <div class="status" id="status"></div>
+    </div>
+
+    <div id="split-view" class="hidden">
+        <h2>Amazon貼付不可のSKUがあります</h2>
+        <div class="warn-box">
+            一部のSKUはAmazonカタログにバーコード（JAN/EAN等）が登録されておらず、<strong>Amazonでの貼付ができません</strong>。<br>
+            Amazon貼付可のSKUは <span class="badge amazon">AMAZON</span>、それ以外は自動的に <span class="badge seller">SELLER</span> に切り替えて送信します。
+        </div>
+
+        <div class="section">
+            <h3><span class="badge amazon">AMAZON</span> Amazon貼付で送信するSKU（<span id="amazon-count">0</span>件）</h3>
+            <div class="sku-list" id="amazon-sku-list"></div>
+        </div>
+
+        <div class="section">
+            <h3><span class="badge seller">SELLER</span> 自分で貼付するSKU（<span id="seller-count">0</span>件）</h3>
+            <div class="sku-list" id="seller-sku-list"></div>
+        </div>
+
+        <div class="section hidden" id="unknown-section">
+            <h3>ASIN抽出不可のSKU（<span id="unknown-count">0</span>件）</h3>
+            <div class="info-box">
+                SKU文字列からASINが抽出できませんでした。安全側に倒してSELLER貼付で送信します。
+            </div>
+            <div class="sku-list" id="unknown-sku-list"></div>
+        </div>
+
+        <div class="buttons">
+            <button type="button" class="secondary" onclick="closeDialog()">キャンセル</button>
+            <button type="button" class="primary" id="continueBtn" onclick="onContinueSplit()">この内容で続行</button>
+        </div>
+        <div class="status" id="splitStatus"></div>
+    </div>
+
+    <div id="error-view" class="hidden">
+        <h2>Amazon貼付エラー</h2>
+        <div class="warn-box">
+            以下のSKUに関してAmazon貼付でエラーが発生しました。<br>
+            全てのSKUを<strong>自分で貼付</strong>に切り替えて再試行しますか？
+        </div>
+        <div class="sku-list" id="failed-sku-list"></div>
+        <details>
+            <summary>エラー詳細</summary>
+            <div class="raw-error" id="raw-error"></div>
+        </details>
+        <div class="buttons">
+            <button type="button" class="secondary" onclick="closeDialog()">キャンセル</button>
+            <button type="button" class="primary" id="retryBtn" onclick="onRetrySeller()">自分で貼付で再試行</button>
+        </div>
+        <div class="status" id="errorStatus"></div>
+    </div>
+
+    <script>
+        var skuCountsData = null;
+
+        function renderSkuList(targetId, skuList, allCounts) {
+            var container = document.getElementById(targetId);
+            container.innerHTML = "";
+            if (!skuList || skuList.length === 0) {
+                container.textContent = "(なし)";
+                return 0;
+            }
+            var total = 0;
+            skuList.forEach(function(sku) {
+                var row = document.createElement("div");
+                row.className = "sku-row";
+                var nameSpan = document.createElement("span");
+                nameSpan.textContent = sku;
+                var countSpan = document.createElement("span");
+                var count = allCounts && allCounts[sku] ? allCounts[sku] : 0;
+                countSpan.textContent = count + "個";
+                row.appendChild(nameSpan);
+                row.appendChild(countSpan);
+                container.appendChild(row);
+                total += Number(count) || 0;
+            });
+            return total;
+        }
+
+        function renderSkuListFromMap(targetId, skuCounts) {
+            var container = document.getElementById(targetId);
+            container.innerHTML = "";
+            var total = 0;
+            Object.keys(skuCounts).forEach(function(sku) {
+                var row = document.createElement("div");
+                row.className = "sku-row";
+                var nameSpan = document.createElement("span");
+                nameSpan.textContent = sku;
+                var countSpan = document.createElement("span");
+                countSpan.textContent = skuCounts[sku] + "個";
+                row.appendChild(nameSpan);
+                row.appendChild(countSpan);
+                container.appendChild(row);
+                total += Number(skuCounts[sku]) || 0;
+            });
+            return total;
+        }
+
+        function loadSkuCounts() {
+            google.script.run
+                .withSuccessHandler(function(data) {
+                    if (!data || Object.keys(data).length === 0) {
+                        document.getElementById("sku-list").textContent = "SKUデータが見つかりません。";
+                        document.getElementById("submitBtn").disabled = true;
+                        return;
+                    }
+                    skuCountsData = data;
+                    var total = renderSkuListFromMap("sku-list", data);
+                    var kinds = Object.keys(data).length;
+                    document.getElementById("summary").textContent = "合計: " + kinds + "種類 / " + total + "個";
+                })
+                .withFailureHandler(function(err) {
+                    document.getElementById("sku-list").textContent = "読み込みエラー: " + err.message;
+                    document.getElementById("submitBtn").disabled = true;
+                })
+                .spapi_getCachedSkuCounts();
+        }
+
+        function onSubmit() {
+            var labelOwner = document.querySelector("input[name='labelOwner']:checked").value;
+            setButtonsDisabled(true);
+            if (labelOwner === "AMAZON") {
+                setStatus("SKUのラベル対応可否を確認中...");
+            } else {
+                setStatus("納品プランを作成中...");
+            }
+            runSubmit(labelOwner);
+        }
+
+        function onRetrySeller() {
+            setButtonsDisabled(true);
+            setStatus("SELLER貼付で再試行中...");
+            runSubmit("SELLER");
+        }
+
+        function onContinueSplit() {
+            setButtonsDisabled(true);
+            setStatus("納品プランを作成中...");
+
+            google.script.run
+                .withSuccessHandler(handleServerResult)
+                .withFailureHandler(function(err) {
+                    setStatus("エラー: " + err.message);
+                    setButtonsDisabled(false);
+                })
+                .spapi_confirmLabelSplitAndSubmit();
+        }
+
+        function runSubmit(labelOwner) {
+            google.script.run
+                .withSuccessHandler(handleServerResult)
+                .withFailureHandler(function(err) {
+                    setStatus("エラー: " + err.message);
+                    setButtonsDisabled(false);
+                })
+                .spapi_submitShipmentPlan(labelOwner);
+        }
+
+        function handleServerResult(result) {
+            if (!result) {
+                setStatus("不明なレスポンスを受信しました。");
+                setButtonsDisabled(false);
+                return;
+            }
+            if (result.status === "success") {
+                onSuccess(result);
+                return;
+            }
+            if (result.status === "labelSplit") {
+                showSplitView(result);
+                return;
+            }
+            if (result.status === "labelError") {
+                showErrorView(result);
+                return;
+            }
+            setStatus("エラー: " + (result.message || "不明なエラー"));
+            setButtonsDisabled(false);
+        }
+
+        function showSplitView(result) {
+            document.getElementById("confirm-view").classList.add("hidden");
+            document.getElementById("error-view").classList.add("hidden");
+            document.getElementById("split-view").classList.remove("hidden");
+
+            var amazonSkus = result.amazonSkus || [];
+            var sellerSkus = result.sellerSkus || [];
+            var unknownSkus = result.unknownSkus || [];
+            var counts = result.skuCounts || skuCountsData || {};
+
+            document.getElementById("amazon-count").textContent = amazonSkus.length;
+            document.getElementById("seller-count").textContent = sellerSkus.length;
+            renderSkuList("amazon-sku-list", amazonSkus, counts);
+            renderSkuList("seller-sku-list", sellerSkus, counts);
+
+            if (unknownSkus.length > 0) {
+                document.getElementById("unknown-section").classList.remove("hidden");
+                document.getElementById("unknown-count").textContent = unknownSkus.length;
+                renderSkuList("unknown-sku-list", unknownSkus, counts);
+            }
+
+            setButtonsDisabled(false);
+            setStatus("");
+        }
+
+        function showErrorView(result) {
+            document.getElementById("confirm-view").classList.add("hidden");
+            document.getElementById("split-view").classList.add("hidden");
+            document.getElementById("error-view").classList.remove("hidden");
+
+            var failedSkus = result.failedSkus || [];
+            if (failedSkus.length === 0) {
+                document.getElementById("failed-sku-list").textContent = "(SKUを特定できませんでした。全SKUが対象の可能性があります)";
+            } else {
+                renderSkuList("failed-sku-list", failedSkus, skuCountsData || {});
+            }
+
+            document.getElementById("raw-error").textContent = (result.rawMessages || []).join("\n");
+            setButtonsDisabled(false);
+            setStatus("");
+        }
+
+        function setStatus(text) {
+            var target;
+            if (!document.getElementById("confirm-view").classList.contains("hidden")) {
+                target = document.getElementById("status");
+            } else if (!document.getElementById("split-view").classList.contains("hidden")) {
+                target = document.getElementById("splitStatus");
+            } else {
+                target = document.getElementById("errorStatus");
+            }
+            target.textContent = text;
+        }
+
+        function setButtonsDisabled(disabled) {
+            var buttons = ["submitBtn", "continueBtn", "retryBtn"];
+            buttons.forEach(function(id) {
+                var btn = document.getElementById(id);
+                if (btn) btn.disabled = disabled;
+            });
+        }
+
+        function onSuccess(result) {
+            setStatus("納品プラン作成完了。セラーセントラルを開きます...");
+            if (result.sellerCentralUrl) {
+                window.open(result.sellerCentralUrl, "_blank");
+            }
+            alert("FBA納品プランを作成しました。\n\n納品プランID: " + result.inboundPlanId);
+            google.script.host.close();
+        }
+
+        function closeDialog() {
+            google.script.host.close();
+        }
+
+        document.addEventListener("DOMContentLoaded", loadSkuCounts);
+    </script>
+</body>
+</html>

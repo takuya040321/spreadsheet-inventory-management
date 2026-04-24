@@ -155,11 +155,16 @@ flowchart TD
 
 | ファイル | 関数 | 役割 |
 |---------|------|------|
-| spapi_Shipment.js | spapi_createShipmentPlan | 納品プラン作成メイン処理 |
+| spapi_Shipment.js | spapi_createShipmentPlan | SKU取得後にHTMLダイアログを表示するメイン処理 |
 | spapi_Shipment.js | spapi_getSelectedSkus_ | 選択範囲からSKU取得（飛び飛び選択対応、フィルター非表示行除外） |
-| spapi_Shipment.js | spapi_confirmSkus_ | SKU確認ダイアログ |
-| spapi_Shipment.js | spapi_createFbaInboundPlan_ | SP-API呼び出し |
+| spapi_Shipment.js | spapi_getCachedSkuCounts | ダイアログがキャッシュからSKUデータを取得 |
+| spapi_Shipment.js | spapi_submitShipmentPlan | ダイアログから呼ばれる納品プラン作成ハンドラ（labelOwner受取、AMAZON時は事前分類） |
+| spapi_Shipment.js | spapi_confirmLabelSplitAndSubmit | 分割確認後の納品プラン送信 |
+| spapi_Shipment.js | spapi_classifySkusByLabelEligibility_ | Amazon貼付可否で全SKUを分類 |
+| spapi_Shipment.js | spapi_createFbaInboundPlan_ | SP-API呼び出し（per-SKU labelOwner指定） |
 | spapi_Shipment.js | spapi_setPrepDetails_ | 梱包カテゴリー設定 |
+| spapi_Shipment.js | spapi_detectLabelOwnerError_ | labelOwnerエラーレスポンスからSKUを検出（フォールバック） |
+| spapi_ShipmentDialog.html | - | SKU一覧表示、ラベル貼付者選択、分割確認/エラー再確認UI |
 | utils_SpApiHelper.js | utils_getSourceAddress | 出荷元住所取得 |
 
 ---

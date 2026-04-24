@@ -1,7 +1,7 @@
 /**
  * FbaShipment.gs
  * FBA納品プラン作成のメイン処理
- * 
+ *
  * 使用するScript Properties:
  * - LWA_CLIENT_ID: LWAクライアントID
  * - LWA_CLIENT_SECRET: LWAクライアントシークレット
@@ -20,6 +20,10 @@
  * - SHIP_FROM_PHONE: 電話番号
  */
 
+var SPAPI_SHIPMENT_CACHE_KEY = "SPAPI_SHIPMENT_SKU_COUNTS";
+var SPAPI_LABEL_SPLIT_CACHE_KEY = "SPAPI_SHIPMENT_LABEL_SPLIT";
+var SPAPI_LABEL_SCANNABLE_TYPES = ["EAN", "JAN", "UPC", "ISBN", "GCID", "GTIN"];
+
 // ===========================================
 // メイン処理
 // ===========================================
@@ -37,13 +41,13 @@ function spapi_createShipmentPlan() {
       return;
     }
 
-    const confirmed = spapi_confirmSkus_(skuCounts);
-    if (!confirmed) {
-      return;
-    }
+    CacheService.getUserCache().put(SPAPI_SHIPMENT_CACHE_KEY, JSON.stringify(skuCounts), 600);
+    CacheService.getUserCache().remove(SPAPI_LABEL_SPLIT_CACHE_KEY);
 
-    const result = spapi_createFbaInboundPlan_(skuCounts);
-    spapi_showResult_(result);
+    const html = HtmlService.createHtmlOutputFromFile("sp-api/spapi_ShipmentDialog")
+      .setWidth(520)
+      .setHeight(620);
+    SpreadsheetApp.getUi().showModalDialog(html, "FBA納品プラン作成");
 
   } catch (error) {
     console.error("FBA納品プラン作成エラー:", error.message);
@@ -106,31 +110,274 @@ function spapi_getSelectedSkus_() {
 }
 
 // ===========================================
-// ユーザー確認ダイアログ
+// ダイアログ連携処理
 // ===========================================
 
 /**
- * SKU一覧を表示し、ユーザーに確認を求める
- * @param {Object} skuCounts - SKUと個数のマップ
- * @returns {boolean} ユーザーが「はい」を選択した場合true
+ * ダイアログからSKUデータを取得する
+ * @returns {Object} SKUと個数のマップ
  */
-function spapi_confirmSkus_(skuCounts) {
-  // SKU一覧を文字列で整形
-  let message = "以下の内容でFBA納品プランを作成しますか？\\n\\n";
-  message += "【SKU一覧】\\n";
-  message += "------------------------\\n";
-  
-  let totalCount = 0;
-  for (const [sku, count] of Object.entries(skuCounts)) {
-    message += `${sku}: ${count}個\\n`;
-    totalCount += count;
+function spapi_getCachedSkuCounts() {
+  const cached = CacheService.getUserCache().get(SPAPI_SHIPMENT_CACHE_KEY);
+  if (!cached) {
+    throw new Error("SKUデータが見つかりません。ダイアログを閉じて再実行してください。");
   }
-  
-  message += "------------------------\\n";
-  message += `合計: ${Object.keys(skuCounts).length}種類 / ${totalCount}個\\n`;
-  
-  const response = Browser.msgBox("FBA納品プラン作成確認", message, Browser.Buttons.YES_NO);
-  return response === "yes";
+  return JSON.parse(cached);
+}
+
+/**
+ * ダイアログから呼ばれる納品プラン作成処理
+ * @param {string} labelOwner - "AMAZON" または "SELLER"
+ * @returns {Object} 処理結果
+ *   - success: 作成成功
+ *   - labelSplit: 一部SKUがAMAZON貼付不可、ユーザー確認が必要
+ *   - labelError: API側でlabelOwnerエラー（フォールバック）
+ */
+function spapi_submitShipmentPlan(labelOwner) {
+  if (labelOwner !== "AMAZON" && labelOwner !== "SELLER") {
+    throw new Error("不正なlabelOwnerが指定されました: " + labelOwner);
+  }
+
+  const cached = CacheService.getUserCache().get(SPAPI_SHIPMENT_CACHE_KEY);
+  if (!cached) {
+    throw new Error("SKUデータが見つかりません。ダイアログを閉じて再実行してください。");
+  }
+  const skuCounts = JSON.parse(cached);
+
+  if (labelOwner === "SELLER") {
+    const labelOwnerMap = {};
+    for (const sku of Object.keys(skuCounts)) {
+      labelOwnerMap[sku] = "SELLER";
+    }
+    return spapi_executeInboundPlan_(skuCounts, labelOwnerMap);
+  }
+
+  const props = PropertiesService.getScriptProperties();
+  const endpoint = props.getProperty("SP_API_ENDPOINT") || "https://sellingpartnerapi-fe.amazon.com";
+  const marketplaceId = props.getProperty("MARKETPLACE_ID");
+
+  if (!marketplaceId) {
+    throw new Error("MARKETPLACE_IDがScript Propertiesに設定されていません。");
+  }
+
+  const accessToken = spapi_getAccessToken_();
+  const classification = spapi_classifySkusByLabelEligibility_(skuCounts, accessToken, marketplaceId, endpoint);
+
+  if (classification.sellerOnlySkus.length === 0 && classification.unknownSkus.length === 0) {
+    return spapi_executeInboundPlan_(skuCounts, classification.labelOwnerMap);
+  }
+
+  CacheService.getUserCache().put(
+    SPAPI_LABEL_SPLIT_CACHE_KEY,
+    JSON.stringify(classification.labelOwnerMap),
+    600
+  );
+
+  const amazonSkus = Object.keys(classification.labelOwnerMap).filter(s => classification.labelOwnerMap[s] === "AMAZON");
+  return {
+    status: "labelSplit",
+    amazonSkus: amazonSkus,
+    sellerSkus: classification.sellerOnlySkus,
+    unknownSkus: classification.unknownSkus,
+    skuCounts: skuCounts
+  };
+}
+
+/**
+ * 分割確認後に納品プランを送信する
+ * @returns {Object} 処理結果（success または labelError）
+ */
+function spapi_confirmLabelSplitAndSubmit() {
+  const splitCached = CacheService.getUserCache().get(SPAPI_LABEL_SPLIT_CACHE_KEY);
+  if (!splitCached) {
+    throw new Error("分類データが見つかりません。ダイアログを閉じて再実行してください。");
+  }
+  const labelOwnerMap = JSON.parse(splitCached);
+
+  const skuCached = CacheService.getUserCache().get(SPAPI_SHIPMENT_CACHE_KEY);
+  if (!skuCached) {
+    throw new Error("SKUデータが見つかりません。ダイアログを閉じて再実行してください。");
+  }
+  const skuCounts = JSON.parse(skuCached);
+
+  CacheService.getUserCache().remove(SPAPI_LABEL_SPLIT_CACHE_KEY);
+
+  return spapi_executeInboundPlan_(skuCounts, labelOwnerMap);
+}
+
+/**
+ * 納品プラン作成の共通実行処理
+ * @param {Object} skuCounts - SKUと個数のマップ
+ * @param {Object} labelOwnerMap - SKUごとのlabelOwner設定
+ * @returns {Object} 処理結果
+ */
+function spapi_executeInboundPlan_(skuCounts, labelOwnerMap) {
+  const apiResult = spapi_createFbaInboundPlan_(skuCounts, labelOwnerMap);
+
+  if (apiResult && apiResult._labelOwnerError) {
+    return {
+      status: "labelError",
+      failedSkus: apiResult._labelOwnerError.failedSkus,
+      rawMessages: apiResult._labelOwnerError.rawMessages
+    };
+  }
+
+  const inboundPlanId = apiResult.inboundPlanId;
+  if (!inboundPlanId) {
+    throw new Error("納品プランIDが取得できませんでした。\\nレスポンス: " + JSON.stringify(apiResult));
+  }
+
+  CacheService.getUserCache().remove(SPAPI_SHIPMENT_CACHE_KEY);
+
+  const sellerCentralUrl = "https://sellercentral.amazon.co.jp/fba/sendtoamazon/confirm_content_step?wf=" + encodeURIComponent(inboundPlanId);
+
+  return {
+    status: "success",
+    inboundPlanId: inboundPlanId,
+    operationId: apiResult.operationId || null,
+    sellerCentralUrl: sellerCentralUrl
+  };
+}
+
+// ===========================================
+// SKU分類処理（Amazon貼付可否判定）
+// ===========================================
+
+/**
+ * SKU文字列からASIN（B + 9英数字）を抽出する
+ * @param {string} sku - SKU文字列
+ * @returns {string|null} 抽出したASIN、抽出不可ならnull
+ */
+function spapi_extractAsinFromSku_(sku) {
+  const str = String(sku).toUpperCase();
+  const tailMatch = str.match(/B[A-Z0-9]{9}$/);
+  if (tailMatch) {
+    return tailMatch[0];
+  }
+  const anyMatch = str.match(/\bB[A-Z0-9]{9}\b/);
+  if (anyMatch) {
+    return anyMatch[0];
+  }
+  return null;
+}
+
+/**
+ * ASINからスキャン可能なidentifier一覧を取得する
+ * @param {string} accessToken - SP-APIアクセストークン
+ * @param {string} asin - 対象ASIN
+ * @param {string} marketplaceId - マーケットプレイスID
+ * @param {string} endpoint - SP-APIエンドポイント
+ * @returns {Array<string>} identifierTypeの配列（例: ["EAN", "JAN"]）
+ */
+function spapi_getAsinIdentifiers_(accessToken, asin, marketplaceId, endpoint) {
+  const url = endpoint +
+              "/catalog/2022-04-01/items/" +
+              encodeURIComponent(asin) +
+              "?marketplaceIds=" + marketplaceId +
+              "&includedData=identifiers";
+
+  const options = {
+    method: "get",
+    headers: {
+      "x-amz-access-token": accessToken,
+      "Accept": "application/json"
+    },
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  const responseCode = response.getResponseCode();
+  const responseBody = response.getContentText();
+
+  if (responseCode !== 200) {
+    throw new Error("Catalog API error (ASIN: " + asin + ", HTTP " + responseCode + "): " + responseBody);
+  }
+
+  const json = JSON.parse(responseBody);
+  const identifierTypes = [];
+
+  if (!json.identifiers || !Array.isArray(json.identifiers)) {
+    return identifierTypes;
+  }
+
+  for (const marketplaceEntry of json.identifiers) {
+    if (marketplaceEntry.marketplaceId !== marketplaceId) {
+      continue;
+    }
+    const innerList = marketplaceEntry.identifiers || [];
+    for (const identifier of innerList) {
+      if (identifier.identifierType) {
+        identifierTypes.push(String(identifier.identifierType).toUpperCase());
+      }
+    }
+  }
+
+  return identifierTypes;
+}
+
+/**
+ * ASINがAmazonラベル貼付に対応しているか判定する
+ * @param {string} accessToken - SP-APIアクセストークン
+ * @param {string} asin - 対象ASIN
+ * @param {string} marketplaceId - マーケットプレイスID
+ * @param {string} endpoint - SP-APIエンドポイント
+ * @returns {boolean} JAN/EAN/UPC/ISBN/GCID/GTINのいずれかが存在すればtrue
+ */
+function spapi_isAsinAmazonLabelEligible_(accessToken, asin, marketplaceId, endpoint) {
+  if (!asin) {
+    return false;
+  }
+  try {
+    const identifiers = spapi_getAsinIdentifiers_(accessToken, asin, marketplaceId, endpoint);
+    return identifiers.some(type => SPAPI_LABEL_SCANNABLE_TYPES.indexOf(type) !== -1);
+  } catch (e) {
+    console.warn("Identifier取得失敗 (ASIN: " + asin + "): " + e.message);
+    return false;
+  }
+}
+
+/**
+ * 全SKUをAmazon貼付可否で分類する
+ * @param {Object} skuCounts - SKUと個数のマップ
+ * @param {string} accessToken - SP-APIアクセストークン
+ * @param {string} marketplaceId - マーケットプレイスID
+ * @param {string} endpoint - SP-APIエンドポイント
+ * @returns {Object} { labelOwnerMap, sellerOnlySkus, unknownSkus }
+ */
+function spapi_classifySkusByLabelEligibility_(skuCounts, accessToken, marketplaceId, endpoint) {
+  const labelOwnerMap = {};
+  const sellerOnlySkus = [];
+  const unknownSkus = [];
+
+  const skus = Object.keys(skuCounts);
+  for (let i = 0; i < skus.length; i++) {
+    const sku = skus[i];
+    const asin = spapi_extractAsinFromSku_(sku);
+
+    if (!asin) {
+      labelOwnerMap[sku] = "SELLER";
+      unknownSkus.push(sku);
+      console.log("ASIN抽出不可、SELLERとして扱う: " + sku);
+      continue;
+    }
+
+    const eligible = spapi_isAsinAmazonLabelEligible_(accessToken, asin, marketplaceId, endpoint);
+    labelOwnerMap[sku] = eligible ? "AMAZON" : "SELLER";
+    if (!eligible) {
+      sellerOnlySkus.push(sku);
+    }
+    console.log("分類: " + sku + " (ASIN: " + asin + ") → " + labelOwnerMap[sku]);
+
+    if (i < skus.length - 1) {
+      Utilities.sleep(600);
+    }
+  }
+
+  return {
+    labelOwnerMap: labelOwnerMap,
+    sellerOnlySkus: sellerOnlySkus,
+    unknownSkus: unknownSkus
+  };
 }
 
 // ===========================================
@@ -156,52 +403,45 @@ function spapi_getSourceAddress_() {
 /**
  * SP-API Fulfillment Inbound API 2024-03-20を使用して納品プランを作成する
  * @param {Object} skuCounts - SKUと個数のマップ
- * @returns {Object} API レスポンス（inboundPlanId等を含む）
+ * @param {Object} labelOwnerMap - SKUごとのlabelOwner設定
+ * @returns {Object} APIレスポンス または { _labelOwnerError: {...} }
  */
-function spapi_createFbaInboundPlan_(skuCounts) {
+function spapi_createFbaInboundPlan_(skuCounts, labelOwnerMap) {
   const props = PropertiesService.getScriptProperties();
   const endpoint = props.getProperty("SP_API_ENDPOINT") || "https://sellingpartnerapi-fe.amazon.com";
   const marketplaceId = props.getProperty("MARKETPLACE_ID");
-  
+
   if (!marketplaceId) {
     throw new Error("MARKETPLACE_IDがScript Propertiesに設定されていません。");
   }
-  
-  // アクセストークンを取得
+
   const accessToken = spapi_getAccessToken_();
-  
-  // 出荷元住所を取得
   const sourceAddress = spapi_getSourceAddress_();
-  
-  // SKU一覧を取得
+
   const mskus = Object.keys(skuCounts);
-  
+
   spapi_setPrepDetails_(endpoint, accessToken, marketplaceId, mskus);
   Utilities.sleep(1000);
-  
-  // リクエストボディを構築
-  // 3ヶ月後の日付を計算（消費期限用）
+
   const expirationDate = new Date();
   expirationDate.setMonth(expirationDate.getMonth() + 3);
   const expiration = Utilities.formatDate(expirationDate, "Asia/Tokyo", "yyyy-MM-dd");
-  
-  // 納品プラン名を生成（日時を含める）
+
   const now = new Date();
   const planName = Utilities.formatDate(now, "Asia/Tokyo", "yyyyMMdd_HHmmss") + "_GAS作成";
-  
-  // items配列を作成（各SKUと数量）
-  const items = spapi_buildItemsArray_(skuCounts, expiration, {});
-  
+
+  const items = spapi_buildItemsArray_(skuCounts, expiration, {}, labelOwnerMap);
+
   const requestBody = {
     destinationMarketplaces: [marketplaceId],
     items: items,
     sourceAddress: sourceAddress,
     name: planName
   };
-  
+
   const apiPath = "/inbound/fba/2024-03-20/inboundPlans";
   const url = endpoint + apiPath;
-  
+
   const options = {
     method: "post",
     contentType: "application/json",
@@ -212,21 +452,28 @@ function spapi_createFbaInboundPlan_(skuCounts) {
     payload: JSON.stringify(requestBody),
     muteHttpExceptions: true
   };
-  
+
   let response = UrlFetchApp.fetch(url, options);
   let responseCode = response.getResponseCode();
   let responseBody = response.getContentText();
-  
-  // prepOwnerエラーの場合、該当SKUをNONEにしてリトライ
+
   if (responseCode === 400) {
-    const retryResult = spapi_handlePrepOwnerError_(responseBody, skuCounts, expiration, endpoint, apiPath, accessToken, marketplaceId, sourceAddress, planName);
+    const hasAmazon = Object.keys(labelOwnerMap).some(k => labelOwnerMap[k] === "AMAZON");
+    if (hasAmazon) {
+      const labelError = spapi_detectLabelOwnerError_(responseBody);
+      if (labelError) {
+        console.warn("labelOwnerエラー検出:", JSON.stringify(labelError));
+        return { _labelOwnerError: labelError };
+      }
+    }
+
+    const retryResult = spapi_handlePrepOwnerError_(responseBody, skuCounts, expiration, endpoint, apiPath, accessToken, marketplaceId, sourceAddress, planName, labelOwnerMap);
     if (retryResult) {
       return retryResult;
     }
   }
-  
+
   if (responseCode !== 200 && responseCode !== 202) {
-    // エラーレスポンスをパース
     let errorMessage = responseBody;
     try {
       const errorData = JSON.parse(responseBody);
@@ -238,7 +485,7 @@ function spapi_createFbaInboundPlan_(skuCounts) {
     }
     throw new Error("SP-APIエラー (HTTP " + responseCode + "):\\n" + errorMessage);
   }
-  
+
   return JSON.parse(responseBody);
 }
 
@@ -256,20 +503,18 @@ function spapi_createFbaInboundPlan_(skuCounts) {
 function spapi_setPrepDetails_(endpoint, accessToken, marketplaceId, mskus) {
   const apiPath = "/inbound/fba/2024-03-20/items/prepDetails";
   const url = endpoint + apiPath;
-  
-  // リクエストボディを構築
-  // デフォルトは prepCategory: "NONE", prepTypes: ["ITEM_NO_PREP"]
+
   const mskuPrepDetails = mskus.map(msku => ({
     msku: msku,
     prepCategory: "NONE",
     prepTypes: ["ITEM_NO_PREP"]
   }));
-  
+
   const requestBody = {
     marketplaceId: marketplaceId,
     mskuPrepDetails: mskuPrepDetails
   };
-  
+
   const options = {
     method: "post",
     contentType: "application/json",
@@ -280,11 +525,11 @@ function spapi_setPrepDetails_(endpoint, accessToken, marketplaceId, mskus) {
     payload: JSON.stringify(requestBody),
     muteHttpExceptions: true
   };
-  
+
   const response = UrlFetchApp.fetch(url, options);
   const responseCode = response.getResponseCode();
   const responseBody = response.getContentText();
-  
+
   if (responseCode !== 200 && responseCode !== 202) {
     console.warn("setPrepDetails APIエラー:", responseBody);
   }
@@ -295,17 +540,19 @@ function spapi_setPrepDetails_(endpoint, accessToken, marketplaceId, mskus) {
  * @param {Object} skuCounts - SKUと個数のマップ
  * @param {string} expiration - 消費期限（yyyy-MM-dd形式）
  * @param {Object} prepOwnerOverrides - prepOwnerを上書きするSKUのマップ（SKU: "NONE"）
+ * @param {Object} labelOwnerMap - SKUごとのlabelOwner設定
  * @returns {Array} items配列
  */
-function spapi_buildItemsArray_(skuCounts, expiration, prepOwnerOverrides) {
+function spapi_buildItemsArray_(skuCounts, expiration, prepOwnerOverrides, labelOwnerMap) {
   const items = [];
   for (const [msku, quantity] of Object.entries(skuCounts)) {
     const prepOwner = prepOwnerOverrides[msku] || "SELLER";
+    const labelOwner = labelOwnerMap[msku] === "AMAZON" ? "AMAZON" : "SELLER";
     items.push({
       msku: msku,
       quantity: quantity,
       prepOwner: prepOwner,
-      labelOwner: "SELLER",
+      labelOwner: labelOwner,
       expiration: expiration
     });
   }
@@ -323,43 +570,40 @@ function spapi_buildItemsArray_(skuCounts, expiration, prepOwnerOverrides) {
  * @param {string} marketplaceId - マーケットプレイスID
  * @param {Object} sourceAddress - 出荷元住所
  * @param {string} planName - 納品プラン名
+ * @param {Object} labelOwnerMap - SKUごとのlabelOwner設定
  * @returns {Object|null} 成功時はAPIレスポンス、リトライ不要または失敗時はnull
  */
-function spapi_handlePrepOwnerError_(responseBody, skuCounts, expiration, endpoint, apiPath, accessToken, marketplaceId, sourceAddress, planName) {
+function spapi_handlePrepOwnerError_(responseBody, skuCounts, expiration, endpoint, apiPath, accessToken, marketplaceId, sourceAddress, planName, labelOwnerMap) {
   try {
     const errorData = JSON.parse(responseBody);
     if (!errorData.errors || errorData.errors.length === 0) {
       return null;
     }
-    
-    // prepOwnerエラーのSKUを抽出
+
     const prepOwnerOverrides = {};
     let hasPrepOwnerError = false;
-    
+
     for (const error of errorData.errors) {
-      // エラーメッセージからSKUを抽出
-      // 例: "ERROR: DHC-2511-0880-1312-1700-B00SY1A5F2 does not require prepOwner but SELLER was assigned"
       const match = error.message.match(/ERROR:\s*(\S+)\s+does not require prepOwner/);
       if (match) {
         prepOwnerOverrides[match[1]] = "NONE";
         hasPrepOwnerError = true;
       }
     }
-    
+
     if (!hasPrepOwnerError) {
       return null;
     }
-    
-    // items配列を再構築
-    const items = spapi_buildItemsArray_(skuCounts, expiration, prepOwnerOverrides);
-    
+
+    const items = spapi_buildItemsArray_(skuCounts, expiration, prepOwnerOverrides, labelOwnerMap);
+
     const requestBody = {
       destinationMarketplaces: [marketplaceId],
       items: items,
       sourceAddress: sourceAddress,
       name: planName
     };
-    
+
     const options = {
       method: "post",
       contentType: "application/json",
@@ -375,14 +619,24 @@ function spapi_handlePrepOwnerError_(responseBody, skuCounts, expiration, endpoi
     const response = UrlFetchApp.fetch(url, options);
     const retryResponseCode = response.getResponseCode();
     const retryResponseBody = response.getContentText();
-    
+
+    if (retryResponseCode === 400) {
+      const hasAmazon = Object.keys(labelOwnerMap).some(k => labelOwnerMap[k] === "AMAZON");
+      if (hasAmazon) {
+        const labelError = spapi_detectLabelOwnerError_(retryResponseBody);
+        if (labelError) {
+          console.warn("prepOwnerリトライ後にlabelOwnerエラー検出:", JSON.stringify(labelError));
+          return { _labelOwnerError: labelError };
+        }
+      }
+    }
+
     if (retryResponseCode === 200 || retryResponseCode === 202) {
       return JSON.parse(retryResponseBody);
     }
-    
-    // リトライも失敗した場合はnullを返し、元のエラー処理に任せる
+
     return null;
-    
+
   } catch (e) {
     console.error("リトライ処理中にエラー:", e.message);
     return null;
@@ -390,64 +644,58 @@ function spapi_handlePrepOwnerError_(responseBody, skuCounts, expiration, endpoi
 }
 
 /**
- * 処理結果を表示し、セラーセントラルを開く
- * @param {Object} result - SP-APIのレスポンス
+ * labelOwnerエラーを検出し、該当SKUと生メッセージを抽出する
+ * @param {string} responseBody - エラーレスポンス
+ * @returns {Object|null} { failedSkus: Array, rawMessages: Array } または null
  */
-function spapi_showResult_(result) {
-  // inboundPlanIdを取得
-  const inboundPlanId = result.inboundPlanId;
-  const operationId = result.operationId;
-  
-  if (!inboundPlanId) {
-    throw new Error("納品プランIDが取得できませんでした。\\nレスポンス: " + JSON.stringify(result));
-  }
+function spapi_detectLabelOwnerError_(responseBody) {
+  try {
+    const errorData = JSON.parse(responseBody);
+    if (!errorData.errors || errorData.errors.length === 0) {
+      return null;
+    }
 
-  // セラーセントラルの納品プラン画面URL
-  // 注意: 実際のURLはAmazonの仕様変更により異なる場合があります
-  // 要相談: ログインが必要なため、自動遷移後に再ログインが求められる場合があります
-  const sellerCentralUrl = "https://sellercentral.amazon.co.jp/fba/sendtoamazon/confirm_content_step?wf=" + encodeURIComponent(inboundPlanId);
-  
-  // 結果メッセージを作成
-  let message = "FBA納品プランを作成しました！\\n\\n";
-  message += "【納品プランID】\\n";
-  message += inboundPlanId + "\\n\\n";
-  
-  if (operationId) {
-    message += "【オペレーションID】\\n";
-    message += operationId + "\\n\\n";
-  }
-  
-  message += "【セラーセントラルURL】\\n";
-  message += sellerCentralUrl + "\\n\\n";
-  message += "「OK」を押すとセラーセントラルを開きます。";
-  
-  Browser.msgBox("FBA納品プラン作成完了", message, Browser.Buttons.OK);
-  
-  // セラーセントラルを新しいタブで開く
-  // 注意: GASからブラウザの新しいタブを直接開くことはできないため、
-  // HTMLダイアログを使用してリンクを提供する
-  spapi_openUrlInNewTab_(sellerCentralUrl);
-}
+    const failedSkus = [];
+    const rawMessages = [];
+    let hasLabelOwnerError = false;
 
-/**
- * URLを新しいタブで開くためのHTMLダイアログを表示する
- * @param {string} url - 開くURL
- */
-function spapi_openUrlInNewTab_(url) {
-  const html = HtmlService.createHtmlOutput(
-    '<html><head><base target="_blank"></head><body>' +
-    '<p>セラーセントラルを開いています...</p>' +
-    '<p><a href="' + url + '" target="_blank" id="link">自動で開かない場合はこちらをクリック</a></p>' +
-    '<script>' +
-    'window.open("' + url + '", "_blank");' +
-    'setTimeout(function(){ google.script.host.close(); }, 3000);' +
-    '</script>' +
-    '</body></html>'
-  )
-  .setWidth(400)
-  .setHeight(150);
-  
-  SpreadsheetApp.getUi().showModalDialog(html, "セラーセントラルを開く");
+    for (const error of errorData.errors) {
+      const msg = error.message || "";
+      if (!/label\s?owner|label\s+ownership|cannot\s+be\s+labeled|not\s+eligible\s+for\s+(?:amazon)?\s*label/i.test(msg)) {
+        continue;
+      }
+      hasLabelOwnerError = true;
+      rawMessages.push(msg);
+
+      let match = msg.match(/ERROR:\s*(\S+)\s+/);
+      if (match) {
+        failedSkus.push(match[1]);
+        continue;
+      }
+      match = msg.match(/(?:for\s+(?:SKU|MSKU)|MSKU|SKU)\s+[\"']?([A-Za-z0-9\-_]+)/i);
+      if (match) {
+        failedSkus.push(match[1]);
+        continue;
+      }
+      match = msg.match(/([A-Za-z0-9][A-Za-z0-9\-_]{3,})\s+(?:does\s+not\s+support|is\s+not\s+eligible|cannot\s+be)/i);
+      if (match) {
+        failedSkus.push(match[1]);
+      }
+    }
+
+    if (!hasLabelOwnerError) {
+      return null;
+    }
+
+    const uniqueSkus = Array.from(new Set(failedSkus));
+    return {
+      failedSkus: uniqueSkus,
+      rawMessages: rawMessages
+    };
+  } catch (e) {
+    console.error("labelOwnerエラー解析失敗:", e.message);
+    return null;
+  }
 }
 
 // ===========================================
@@ -477,16 +725,16 @@ function spapi_checkScriptProperties() {
     "SHIP_FROM_COUNTRY_CODE",
     "SHIP_FROM_PHONE"
   ];
-  
+
   let message = "【Script Properties設定状況】\\n\\n";
-  
+
   for (const key of keys) {
     const value = props.getProperty(key);
-    const status = value ? "✓ 設定済み" : "✗ 未設定";
+    const status = value ? "設定済み" : "未設定";
     const displayValue = value ? (key.includes("SECRET") || key.includes("TOKEN") ? "****" : value.substring(0, 20) + (value.length > 20 ? "..." : "")) : "-";
     message += `${key}: ${status}\\n  値: ${displayValue}\\n\\n`;
   }
-  
+
   console.log(message.replace(/\\n/g, "\n"));
   Browser.msgBox("Script Properties確認", message, Browser.Buttons.OK);
 }

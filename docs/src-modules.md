@@ -184,19 +184,33 @@ FBA納品プラン作成モジュール。
 
 | 関数名 | 役割 |
 |--------|------|
-| spapi_createShipmentPlan | メイン処理: FBA納品プランを作成 |
+| spapi_createShipmentPlan | メイン処理: SKU取得後にHTMLダイアログを表示 |
 | spapi_getSelectedSkus_ | 選択範囲からSKUを取得・集計（飛び飛び選択対応、フィルター非表示行除外） |
-| spapi_confirmSkus_ | SKU一覧を表示し確認を求める |
+| spapi_getCachedSkuCounts | ダイアログがキャッシュからSKUデータを取得 |
+| spapi_submitShipmentPlan | ダイアログから呼ばれる納品プラン作成ハンドラ（labelOwner受取、AMAZON時は事前分類） |
+| spapi_confirmLabelSplitAndSubmit | 分割確認後、キャッシュされたlabelOwnerMapで納品プランを送信 |
+| spapi_executeInboundPlan_ | 納品プラン作成の共通実行処理 |
+| spapi_extractAsinFromSku_ | SKU文字列からASIN（B + 9英数字）を抽出 |
+| spapi_getAsinIdentifiers_ | Catalog APIでASINのidentifier一覧を取得 |
+| spapi_isAsinAmazonLabelEligible_ | スキャン可能なバーコード有無でAmazon貼付可否を判定 |
+| spapi_classifySkusByLabelEligibility_ | 全SKUをAmazon貼付可否で分類 |
 | spapi_getAccessToken_ | アクセストークンを取得 |
 | spapi_getSourceAddress_ | 出荷元住所を取得 |
-| spapi_createFbaInboundPlan_ | SP-APIで納品プランを作成 |
+| spapi_createFbaInboundPlan_ | SP-APIで納品プランを作成（labelOwnerMap指定） |
 | spapi_setPrepDetails_ | SKUの梱包カテゴリーを設定 |
-| spapi_buildItemsArray_ | items配列を構築 |
+| spapi_buildItemsArray_ | items配列を構築（per-SKU labelOwnerを反映） |
 | spapi_handlePrepOwnerError_ | prepOwnerエラー時のリトライ処理 |
-| spapi_showResult_ | 結果を表示しセラーセントラルを開く |
-| spapi_openUrlInNewTab_ | URLを新しいタブで開くダイアログ |
+| spapi_detectLabelOwnerError_ | labelOwnerエラーレスポンスから該当SKUを検出（フォールバック） |
 | spapi_checkScriptProperties | スクリプトプロパティの設定状況を確認 |
 | spapi_testSpApiConnection | SP-API接続テスト |
+
+### spapi_ShipmentDialog.html
+
+FBA納品プラン作成確認ダイアログ。以下のビューを持つ:
+
+- **確認ビュー**: SKU一覧、ラベル貼付者選択（AMAZON/SELLER、デフォルトAMAZON）、はい/キャンセル
+- **分割確認ビュー**: Amazon貼付可SKUとSELLER貼付SKUを分けて表示、続行/キャンセル
+- **エラービュー**: APIエラー時のフォールバック再確認、SELLERで再試行/キャンセル
 
 ---
 

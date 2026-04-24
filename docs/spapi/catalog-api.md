@@ -142,7 +142,9 @@ Listings Items APIで商品登録する際、productTypeが必須となる。ASI
 
 | ファイル | 関数 | 役割 |
 |---------|------|------|
-| spapi_registerProducts.js | spapi_getProductTypeByAsin | ASINから商品タイプを取得 |
+| spapi_registerProducts.js | spapi_getProductTypeByAsin | ASINから商品タイプを取得（includedData=summaries,productTypes） |
+| spapi_Shipment.js | spapi_getAsinIdentifiers_ | ASINのidentifier一覧を取得（includedData=identifiers） |
+| spapi_Shipment.js | spapi_isAsinAmazonLabelEligible_ | JAN/EAN/UPC/ISBN/GCID/GTINの有無でAmazon貼付可否を判定 |
 
 ### 処理フロー
 
