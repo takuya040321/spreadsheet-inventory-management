@@ -137,10 +137,14 @@ function tools_copyCheckedRowsToProductManagement() {
     
     Logger.log("コピー完了: " + rowsToCopyCO.length + "行");
     
-    // コピー元のデータを削除（C列～O列、Y列）
+    // コピー元のデータを削除（A列～O列、Y列）
     for (const rowNumber of processedSourceRows) {
-      // C列～O列をクリア（列3から13列分）
-      sourceSheet.getRange(rowNumber, 3, 1, 13).clearContent();
+
+      // A列のチェックボックスをFalseに設定（列1）
+      sourceSheet.getRange(rowNumber, 1, 1, 1).setValue(false);
+
+      // C列～O列をクリア（列2から14列分）
+      sourceSheet.getRange(rowNumber, 2, 1, 14).clearContent();
       
       // Y列をクリア（列25）
       sourceSheet.getRange(rowNumber, 25, 1, 1).clearContent();
@@ -227,85 +231,4 @@ function tools_getLastRowWithData(sheet) {
   }
   
   return 0; // データなし
-}
-
-
-/**
- * スプレッドシートにボタンを設置するためのカスタムメニューを追加
- * スプレッドシートを開いた時に自動実行される
- */
-function tools_onOpen() {
-  const ui = SpreadsheetApp.getUi();
-  ui.createMenu("商品管理")
-    .addItem("チェック行をコピー", "copyCheckedRowsToProductManagement")
-    .addSeparator()
-    .addItem("使い方を表示", "showUsage")
-    .addToUi();
-  
-  Logger.log("カスタムメニュー「商品管理」を追加しました");
-}
-
-
-/**
- * 使い方を表示
- */
-function tools_showUsage() {
-  const message = 
-    "【使い方】\n\n" +
-    "1. A列のチェックボックスにチェックを入れる（3行目以降）\n" +
-    "2. B列に個数を入力する\n" +
-    "3. メニュー「商品管理」→「チェック行をコピー」を実行\n\n" +
-    "【シート構成】\n" +
-    "・2行目：ヘッダー行\n" +
-    "・3行目以降：データ行\n\n" +
-    "【コピー対象列】\n" +
-    "C列～O列、Y列\n\n" +
-    "【処理内容】\n" +
-    "・商品管理シートにC列～O列、Y列のみ転記\n" +
-    "・転記後、コピー元のC列～O列、Y列を削除\n\n" +
-    "【注意事項】\n" +
-    "・「商品管理」シートが必要です\n" +
-    "・個数は1～1000の範囲で指定してください\n" +
-    "・空行や無効な個数はスキップされます";
-  
-  SpreadsheetApp.getUi().alert("使い方", message, SpreadsheetApp.getUi().ButtonSet.OK);
-}
-
-
-/**
- * デバッグ用：現在のシート情報を出力
- */
-function tools_debugSheetInfo() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getActiveSheet();
-  
-  Logger.log("=== シート情報 ===");
-  Logger.log("スプレッドシート名: " + ss.getName());
-  Logger.log("アクティブシート名: " + sheet.getName());
-  Logger.log("最終行: " + sheet.getLastRow());
-  Logger.log("最終列: " + sheet.getLastColumn());
-  Logger.log("データ開始行: " + DATA_START_ROW);
-  
-  // 商品管理シートの確認
-  const targetSheet = ss.getSheetByName(TARGET_SHEET_NAME);
-  if (targetSheet) {
-    Logger.log("商品管理シート: 存在します（最終行: " + targetSheet.getLastRow() + "）");
-  } else {
-    Logger.log("商品管理シート: 存在しません");
-  }
-  
-  // 2行目（ヘッダー）と最初のデータ行を表示
-  Logger.log("=== データプレビュー ===");
-  Logger.log("2行目（ヘッダー）:");
-  const headerRow = sheet.getRange(2, 1, 1, 5).getValues()[0];
-  Logger.log("  A=" + headerRow[0] + ", B=" + headerRow[1] + ", C=" + headerRow[2]);
-  
-  if (sheet.getLastRow() >= DATA_START_ROW) {
-    Logger.log("3行目以降（データ行、最初の5行）:");
-    const dataRowCount = Math.min(5, sheet.getLastRow() - DATA_START_ROW + 1);
-    const previewData = sheet.getRange(DATA_START_ROW, 1, dataRowCount, 3).getValues();
-    previewData.forEach((row, index) => {
-      Logger.log("  行" + (index + DATA_START_ROW) + ": A=" + row[0] + ", B=" + row[1] + ", C=" + row[2]);
-    });
-  }
 }
